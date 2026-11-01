@@ -28,7 +28,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
-#define SRATE_VERSION "0.2.0"
+#define SRATE_VERSION "0.2.1"
 
 typedef struct _snd_pcm snd_pcm_t;
 typedef struct _snd_pcm_hw_params snd_pcm_hw_params_t;
@@ -497,6 +497,29 @@ static int try_relaxed(snd_pcm_t *pcm, snd_pcm_hw_params_t *p,
         slog("  Rettung %zu: Periode %lu->%lu, Puffer >=%lu ->%lu (%d/%d/%d) -> %d %s",
              i + 1, tries[i].per, pp, tries[i].buf, bnear, e1, e2, e3, r, r < 0 ? errstr(r) : "ok");
         if (r == 0) { pcopy(p, t); break; }
+    }
+    /* Alles gescheitert: eingrenzen, woran es liegt (nur Diagnose) */
+    if (r < 0) {
+        int (*hw_free)(snd_pcm_t *) = (int (*)(snd_pcm_t *))dlsym(RTLD_DEFAULT, "snd_pcm_hw_free");
+        struct { const char *what; int fmt; unsigned ch, rate; } probe[] = {
+            { "ohne Umrechnung (48000 Hz)",          fmt, ch, 48000 },
+            { "2 Kanaele, 44100 Hz",                 fmt, 2,  44100 },
+            { "2 Kanaele, 48000 Hz",                 fmt, 2,  48000 },
+            { "16 Bit, gleiche Kanaele, 44100 Hz",   2,   ch, 44100 },
+            { "16 Bit, 2 Kanaele, 44100 Hz",         2,   2,  44100 },
+        };
+        slog("  Diagnose (wird nicht uebernommen):");
+        for (size_t i = 0; i < sizeof probe / sizeof probe[0]; i++) {
+            if (pany(pcm, t) < 0) break;
+            int e = s_access(pcm, t, acc);
+            if (!e) e = s_format(pcm, t, probe[i].fmt);
+            if (!e) e = s_ch(pcm, t, probe[i].ch);
+            if (!e) e = s_rate(pcm, t, probe[i].rate, 0);
+            ufr pp = 256, bb = 1024; int dd = 0;
+            if (!e) { s_per(pcm, t, &pp, &dd); s_buf(pcm, t, &bb); e = real_hw(pcm, t); }
+            slog("    %-36s -> %d %s", probe[i].what, e, e < 0 ? errstr(e) : "ok");
+            if (e == 0 && hw_free) hw_free(pcm);
+        }
     }
     pfree(t);
     return r;

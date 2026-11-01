@@ -23,6 +23,8 @@ test: build/host/$(LIB)
 	rm -f build/host/srate.log
 	SRATE_PROC_CARDS=build/host/cards LD_PRELOAD=$(CURDIR)/build/host/$(LIB) build/host/test_alsa
 	grep -q "set_rate null 44100 -> 0" build/host/srate.log
+	SRATE_TEST_FAILFIRST=1 SRATE_TEST_DMX=1 TEST_CH=32 SRATE_PROC_CARDS=build/host/cards LD_PRELOAD=$(CURDIR)/build/host/$(LIB) build/host/test_alsa | grep -q "writei 256 -> 256"
+	grep -q "Kanal-Reduktion aktiv: 32 -> 2" build/host/srate.log
 	@echo "Host-Tests OK"
 
 dist: build/arm/$(LIB)

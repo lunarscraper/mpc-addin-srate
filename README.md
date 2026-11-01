@@ -61,20 +61,19 @@ Bietet einer der Modi schon 44100 an, brauchst du das Addin für diesen Modus ni
 sh install.sh
 ```
 
-Das Skript sucht die Startdatei, in der dein vorhandenes Addin (mpc-addin-surface)
-per LD_PRELOAD geladen wird, zeigt an, was es ändern will, und fragt nach.
-Die Startdatei wird vorher gesichert (`….srate-bak`). Findet es nichts
-Eindeutiges, bricht es ab, ohne etwas zu ändern – dann die Ausgabe an mich.
+Das Skript kopiert die Bibliothek nach `/usr/lib/mpc-addin-srate/` und trägt sie
+in `/etc/ld.so.preload` ein (vorhandene Einträge, z. B. andere Addins, bleiben
+erhalten). Das Log landet im Ordner auf der SD-Karte, von dem aus installiert wurde.
 
 Danach **Force neu starten**, SH-4d anstecken und in den Einstellungen als
 Audio-Interface wählen.
 
 ## 5. Testen und Log
 
-Log liegt neben dem vorhandenen Addin (Pfad zeigt `install.sh` am Ende an):
+Log liegt im Installationsordner auf der SD-Karte:
 
 ```
-cat <Ordner>/srate.log
+cat /media/<SD-Karte>/mpc-addin-srate/srate.log
 ```
 
 Erfolg sieht so aus:
@@ -98,5 +97,5 @@ Bitte für beide Modi (vendor/class) testen und die Logs schicken.
 
 ## Notaus und Entfernen
 
-- Sofort abschalten: im Addin-Ordner `touch srate.off`, Force neu starten.
-- Ganz entfernen: `sh srate-uninstall.sh` im Addin-Ordner, Force neu starten.
+- Sofort abschalten: `touch /usr/lib/mpc-addin-srate/srate.off`, Force neu starten.
+- Ganz entfernen: `sh /usr/lib/mpc-addin-srate/srate-uninstall.sh`, Force neu starten.

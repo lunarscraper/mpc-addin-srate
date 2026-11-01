@@ -28,7 +28,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
-#define SRATE_VERSION "0.2.1"
+#define SRATE_VERSION "0.3.0"
 
 typedef struct _snd_pcm snd_pcm_t;
 typedef struct _snd_pcm_hw_params snd_pcm_hw_params_t;
@@ -295,6 +295,40 @@ static int is_tracked(snd_pcm_t *p)
     return r;
 }
 
+/* ---------- Kanal-Reduktion für die Wiedergabe ----------
+ * ALSA kann bei der Wiedergabe nicht gleichzeitig 32 -> 2 Kanäle UND
+ * 44,1 -> 48 kHz umsetzen. Dann öffnen wir das Gerät mit seiner eigenen
+ * Kanalzahl, die Force schreibt weiter 32 Kanäle, und wir übernehmen
+ * beim Schreiben nur die ersten Kanäle (= Haupt-Ausgang L/R).
+ */
+typedef struct { snd_pcm_t *pcm; unsigned app_ch, dev_ch, bps; unsigned char *buf; size_t cap; } dmx_t;
+#define MAXDMX 8
+static dmx_t dmx[MAXDMX];
+
+static void dmx_add(snd_pcm_t *pcm, unsigned app_ch, unsigned dev_ch, unsigned bps)
+{
+    pthread_mutex_lock(&trk_mx);
+    for (int i = 0; i < MAXDMX; i++)
+        if (!dmx[i].pcm || dmx[i].pcm == pcm) {
+            free(dmx[i].buf);
+            dmx[i] = (dmx_t){ pcm, app_ch, dev_ch, bps, NULL, 0 };
+            break;
+        }
+    pthread_mutex_unlock(&trk_mx);
+}
+static void dmx_remove(snd_pcm_t *pcm)
+{
+    pthread_mutex_lock(&trk_mx);
+    for (int i = 0; i < MAXDMX; i++)
+        if (dmx[i].pcm == pcm) { free(dmx[i].buf); dmx[i] = (dmx_t){0}; }
+    pthread_mutex_unlock(&trk_mx);
+}
+static dmx_t *dmx_find(snd_pcm_t *pcm)
+{
+    for (int i = 0; i < MAXDMX; i++) if (dmx[i].pcm == pcm) return &dmx[i];
+    return NULL;
+}
+
 /* ---------- Hooks ---------- */
 
 int snd_pcm_open(snd_pcm_t **pcmp, const char *name, int stream, int mode)
@@ -323,6 +357,7 @@ int snd_pcm_close(snd_pcm_t *pcm)
 {
     REAL(snd_pcm_close);
     if (!disabled && is_tracked(pcm)) { slog("close %s", pname(pcm)); untrack(pcm); }
+    dmx_remove(pcm);
     return real_snd_pcm_close(pcm);
 }
 
@@ -480,23 +515,55 @@ static int try_relaxed(snd_pcm_t *pcm, snd_pcm_hw_params_t *p,
     snd_pcm_hw_params_t *t = NULL;
     if (pmalloc(&t) < 0) return -22;
     int r = -22;
-    for (size_t i = 0; i < sizeof tries / sizeof tries[0]; i++) {
-        if (pany(pcm, t) < 0) break;
-        if (s_access(pcm, t, acc) < 0 || s_format(pcm, t, fmt) < 0 ||
-            s_ch(pcm, t, ch) < 0 || s_rate(pcm, t, rate, 0) < 0) {
-            slog("  Rettung: Grundwerte (Format %d, %u Kanaele, %u Hz) nicht setzbar", fmt, ch, rate);
-            break;
+    /* Kanalzahl: erst wie verlangt, sonst (Wiedergabe) mit 2 Kanälen
+       und eigener Kanal-Reduktion beim Schreiben */
+    int (*p_stream)(snd_pcm_t *) = (int (*)(snd_pcm_t *))dlsym(RTLD_DEFAULT, "snd_pcm_stream");
+    int playback = p_stream ? p_stream(pcm) == 0 : 0;
+    unsigned chans[2] = { ch, 2 };
+    int nchans = (playback && ch > 2) ? 2 : 1;
+    unsigned used_ch = ch;
+    int c0 = 0;
+    if (getenv("SRATE_TEST_DMX") && ch > 2) { nchans = 2; c0 = 1; }   /* nur für Tests */
+    for (int c = c0; c < nchans && r < 0; c++) {
+        unsigned dch = chans[c];
+        if (c > 0) slog("  Rettung mit %u statt %u Kanaelen (Reduktion im Addin):", dch, ch);
+        for (size_t i = 0; i < sizeof tries / sizeof tries[0]; i++) {
+            if (pany(pcm, t) < 0) break;
+            if (s_access(pcm, t, acc) < 0 || s_format(pcm, t, fmt) < 0 ||
+                s_ch(pcm, t, dch) < 0 || s_rate(pcm, t, rate, 0) < 0) {
+                slog("  Rettung: Grundwerte (Format %d, %u Kanaele, %u Hz) nicht setzbar", fmt, dch, rate);
+                break;
+            }
+            ufr pp = tries[i].per, bb = tries[i].buf;
+            int dd = 0;
+            int e1 = s_per(pcm, t, &pp, &dd);
+            int e2 = s_buf_min(pcm, t, &bb);
+            ufr bnear = tries[i].buf;
+            int e3 = s_buf(pcm, t, &bnear);
+            r = real_hw(pcm, t);
+            slog("  Rettung %zu: Periode %lu->%lu, Puffer >=%lu ->%lu (%d/%d/%d) -> %d %s",
+                 i + 1, tries[i].per, pp, tries[i].buf, bnear, e1, e2, e3, r, r < 0 ? errstr(r) : "ok");
+            if (r == 0) { used_ch = dch; break; }
         }
-        ufr pp = tries[i].per, bb = tries[i].buf;
-        int dd = 0;
-        int e1 = s_per(pcm, t, &pp, &dd);
-        int e2 = s_buf_min(pcm, t, &bb);
-        ufr bnear = tries[i].buf;
-        int e3 = s_buf(pcm, t, &bnear);
-        r = real_hw(pcm, t);
-        slog("  Rettung %zu: Periode %lu->%lu, Puffer >=%lu ->%lu (%d/%d/%d) -> %d %s",
-             i + 1, tries[i].per, pp, tries[i].buf, bnear, e1, e2, e3, r, r < 0 ? errstr(r) : "ok");
-        if (r == 0) { pcopy(p, t); break; }
+    }
+    if (r == 0) {
+        if (used_ch == ch) {
+            pcopy(p, t);
+        } else {
+            /* Force soll weiter ihre 32 Kanäle sehen, aber mit den
+               tatsächlichen Puffergrößen */
+            ufr ap = 0, ab = 0; int ad = 0;
+            g_per(t, &ap, &ad); g_buf(t, &ab);
+            pcopy(p, want);
+            int dd = 0;
+            s_per(pcm, p, &ap, &dd);
+            s_buf(pcm, p, &ab);
+            int (*fwidth)(int) = (int (*)(int))dlsym(RTLD_DEFAULT, "snd_pcm_format_physical_width");
+            unsigned bps = fwidth ? (unsigned)fwidth(fmt) / 8 : 4;
+            dmx_add(pcm, ch, used_ch, bps);
+            slog("  Kanal-Reduktion aktiv: %u -> %u Kanaele, %u Byte/Sample, Periode %lu, Puffer %lu",
+                 ch, used_ch, bps, ap, ab);
+        }
     }
     /* Alles gescheitert: eingrenzen, woran es liegt (nur Diagnose) */
     if (r < 0) {
@@ -673,4 +740,37 @@ int snd_pcm_recover(snd_pcm_t *pcm, int err, int silent)
             slog("recover %s err=%d %s (Xrun Nr. %lu)", pname(pcm), err, errstr(err), count);
     }
     return real_snd_pcm_recover(pcm, err, silent);
+}
+
+/* Wiedergabe mit Kanal-Reduktion */
+long snd_pcm_writei(snd_pcm_t *pcm, const void *buffer, unsigned long size)
+{
+    REAL(snd_pcm_writei);
+    dmx_t *d = disabled ? NULL : dmx_find(pcm);
+    if (!d || !buffer) return real_snd_pcm_writei(pcm, buffer, size);
+
+    size_t in_frame = (size_t)d->app_ch * d->bps, out_frame = (size_t)d->dev_ch * d->bps;
+    size_t need = size * out_frame;
+    if (need > d->cap) {
+        unsigned char *nb = realloc(d->buf, need);
+        if (!nb) return -12;
+        d->buf = nb; d->cap = need;
+    }
+    const unsigned char *src = buffer;
+    unsigned char *dst = d->buf;
+    for (unsigned long f = 0; f < size; f++) {
+        memcpy(dst, src, out_frame);
+        src += in_frame; dst += out_frame;
+    }
+    return real_snd_pcm_writei(pcm, d->buf, size);
+}
+
+/* Falls die Force die aktuellen Parameter nachliest: mitloggen */
+int snd_pcm_hw_params_current(snd_pcm_t *pcm, snd_pcm_hw_params_t *p)
+{
+    REAL(snd_pcm_hw_params_current);
+    int r = real_snd_pcm_hw_params_current(pcm, p);
+    if (!disabled && is_tracked(pcm))
+        slog("hw_params_current %s -> %d%s", pname(pcm), r, dmx_find(pcm) ? " (Achtung: Kanal-Reduktion aktiv)" : "");
+    return r;
 }

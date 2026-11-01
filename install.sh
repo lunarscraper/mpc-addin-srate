@@ -1,10 +1,10 @@
 #!/bin/sh
-# Installiert mpc-addin-srate neben einem bereits vorhandenen LD_PRELOAD-Addin
-# (z. B. mpc-addin-surface). Das Skript sucht die Startdatei, die LD_PRELOAD
-# setzt, legt eine Sicherung an und hängt diese Bibliothek vorne an.
+# Installiert mpc-addin-srate über /etc/ld.so.preload.
+# Das funktioniert unabhängig davon, wie andere Addins (z. B. mpc-addin-surface)
+# eingebunden sind – keine Startdatei muss gesucht oder verändert werden.
 #
-# Aufruf auf der Force (per SSH, im entpackten Ordner):
-#   sh install.sh            zeigt, was passieren würde, und fragt nach
+# Aufruf auf der Force (per SSH, im entpackten Ordner auf der SD-Karte):
+#   sh install.sh            zeigt, was passiert, und fragt nach
 #   sh install.sh --yes      ohne Rückfrage
 
 set -e
@@ -12,6 +12,13 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 LIB=libmpc-addin-srate.so
 YES=0
 [ "$1" = "--yes" ] && YES=1
+
+ROOT=${SRATE_TEST_ROOT:-}                 # nur für Tests
+PRELOADFILE="$ROOT/etc/ld.so.preload"
+TARGETDIR="$ROOT/usr/lib/mpc-addin-srate"
+NEWSO="$TARGETDIR/$LIB"
+# Pfad, wie er in ld.so.preload steht (ohne Test-Präfix)
+SOPATH="/usr/lib/mpc-addin-srate/$LIB"
 
 say() { echo "[srate] $*"; }
 die() { echo "[srate] FEHLER: $*"; exit 1; }
@@ -23,49 +30,19 @@ case "$ARCH" in
 esac
 [ -f "$HERE/$LIB" ] || die "$LIB fehlt im Ordner $HERE"
 
-# 1. Startdateien suchen, die LD_PRELOAD setzen und ein Addin laden
-say "Suche Startdatei mit LD_PRELOAD ..."
-CANDS=""
-ROOTS=${SRATE_TEST_ROOTS:-/etc /usr/bin /usr/sbin /usr/local /opt /media}
-for f in $(find $ROOTS -maxdepth 4 -type f -size -64k 2>/dev/null); do
-  case "$f" in
-    "$HERE"/*|*.srate-bak|*/srate-*|*.md|*.txt|*.c|*.h|*.yml|*.log) continue ;;
-  esac
-  if grep -qs "LD_PRELOAD" "$f" && grep -qs "\.so" "$f"; then
-    CANDS="$CANDS $f"
-  fi
-done
-N=$(echo $CANDS | wc -w)
-if [ "$N" -eq 0 ]; then
-  die "Keine Startdatei mit LD_PRELOAD gefunden. Wie ist mpc-addin-surface bei dir installiert? Schick mir bitte die Ausgabe von:  grep -rls LD_PRELOAD /etc /media 2>/dev/null"
-fi
-if [ "$N" -gt 1 ]; then
-  # Bevorzugt die Datei, in der schon ein mpc-addin steht
-  PREF=""
-  for f in $CANDS; do grep -qs "mpc-addin\|addin" "$f" && PREF="$PREF $f"; done
-  [ "$(echo $PREF | wc -w)" -eq 1 ] && CANDS=$PREF
-fi
-N=$(echo $CANDS | wc -w)
-if [ "$N" -ne 1 ]; then
-  say "Mehrere mögliche Startdateien gefunden:"
-  for f in $CANDS; do echo "   $f"; grep -n "LD_PRELOAD" "$f" | head -n 3 | sed 's/^/      /'; done
-  die "Nicht eindeutig – bitte schick mir diese Ausgabe, dann passe ich das Skript an."
-fi
-LAUNCHER=$(echo $CANDS)
+# Log auf die SD-Karte legen, wenn wir von dort installiert werden
+LOGPATH=""
+case "$HERE" in /media/*) LOGPATH="$HERE/srate.log" ;; esac
 
-LINE=$(grep -n "LD_PRELOAD" "$LAUNCHER" | head -n1)
-LINENO_=${LINE%%:*}
-OLDSO=$(echo "${LINE#*:}" | grep -o '/[^ "'"'"':]*\.so[^ "'"'"':]*' | head -n1)
-[ -n "$OLDSO" ] || die "Konnte in $LAUNCHER keinen .so-Pfad in der LD_PRELOAD-Zeile erkennen: ${LINE#*:}"
-TARGETDIR=$(dirname "$OLDSO")
-NEWSO="$TARGETDIR/$LIB"
-
-say "Startdatei:        $LAUNCHER (Zeile $LINENO_)"
-say "Vorhandenes Addin: $OLDSO"
-say "Neues Addin nach:  $NEWSO"
-if grep -qs "$LIB" "$LAUNCHER"; then
-  say "Startdatei enthält $LIB bereits – kopiere nur die Dateien neu."
+say "Bibliothek nach:   $NEWSO"
+say "Eintrag in:        $PRELOADFILE"
+if [ -s "$PRELOADFILE" ]; then
+  say "Vorhandener Inhalt von $PRELOADFILE:"
+  sed 's/^/     /' "$PRELOADFILE"
+else
+  say "$PRELOADFILE gibt es noch nicht – wird angelegt."
 fi
+[ -n "$LOGPATH" ] && say "Log nach:          $LOGPATH"
 
 if [ $YES -eq 0 ]; then
   printf "[srate] Fortfahren? (j/N) "
@@ -73,39 +50,63 @@ if [ $YES -eq 0 ]; then
   case "$ANS" in j|J|y|Y) ;; *) say "Abgebrochen, nichts verändert."; exit 0 ;; esac
 fi
 
-# 2. Schreibschutz ggf. aufheben
+# Schreibschutz des Systems ggf. aufheben
 REMOUNTED=""
 ensure_rw() {
+  mkdir -p "$1" 2>/dev/null || true
   if ! touch "$1/.srate-w" 2>/dev/null; then
-    MP=$(df "$1" | awk 'NR==2{print $6}')
+    # nächsten vorhandenen Ordner suchen, um den Einhängepunkt zu bestimmen
+    P="$1"
+    while [ ! -d "$P" ] && [ "$P" != "/" ]; do P=$(dirname "$P"); done
+    MP=$(df -P "$P" 2>/dev/null | awk 'NR==2{print $NF}')
+    [ -n "$MP" ] || MP=/
     say "Mache $MP beschreibbar ..."
     mount -o remount,rw "$MP" && REMOUNTED="$REMOUNTED $MP"
+    mkdir -p "$1"
     touch "$1/.srate-w" || die "$1 ist nicht beschreibbar."
   fi
   rm -f "$1/.srate-w"
 }
+ensure_rw "$(dirname "$PRELOADFILE")"
 ensure_rw "$TARGETDIR"
-ensure_rw "$(dirname "$LAUNCHER")"
 
-# 3. Dateien kopieren (vorhandene srate.conf bleibt erhalten)
-cp "$HERE/$LIB" "$NEWSO"
+# Dateien kopieren
+cp "$HERE/$LIB" "$NEWSO.new" && mv "$NEWSO.new" "$NEWSO"
 chmod 755 "$NEWSO"
-[ -f "$TARGETDIR/srate.conf" ] || cp "$HERE/srate.conf" "$TARGETDIR/srate.conf"
+cp "$HERE/srate.conf" "$TARGETDIR/srate.conf"
+[ -n "$LOGPATH" ] && printf '\nlog = %s\n' "$LOGPATH" >> "$TARGETDIR/srate.conf"
 cp "$HERE/diag.sh" "$TARGETDIR/srate-diag.sh"
 cp "$HERE/uninstall.sh" "$TARGETDIR/srate-uninstall.sh"
+rm -f "$TARGETDIR/srate.off"
 
-# 4. Startdatei sichern und anpassen
-if ! grep -qs "$LIB" "$LAUNCHER"; then
-  [ -f "$LAUNCHER.srate-bak" ] || cp -p "$LAUNCHER" "$LAUNCHER.srate-bak"
-  sed -i "${LINENO_}s|$OLDSO|$NEWSO:$OLDSO|" "$LAUNCHER"
-  grep -qs "$LIB" "$LAUNCHER" || die "Anpassung fehlgeschlagen – Sicherung liegt unter $LAUNCHER.srate-bak"
+# ld.so.preload ergänzen (Sicherung, falls schon vorhanden)
+if [ -f "$PRELOADFILE" ]; then
+  [ -f "$TARGETDIR/ld.so.preload.bak" ] || cp -p "$PRELOADFILE" "$TARGETDIR/ld.so.preload.bak"
+else
+  echo "neu" > "$TARGETDIR/ld.so.preload.created"
 fi
-echo "$LAUNCHER" > "$TARGETDIR/srate.installed"
+if ! grep -qsF "$SOPATH" "$PRELOADFILE"; then
+  echo "$SOPATH" >> "$PRELOADFILE"
+fi
+echo "$PRELOADFILE" > "$TARGETDIR/srate.installed"
 sync
+
+# Kurztest: lädt die Bibliothek? (ein neuer Befehl würde sonst meckern)
+if [ -z "$SRATE_TEST" ]; then
+  if /bin/true 2>&1 | grep -q "cannot be preloaded"; then
+    sed -i "\|$SOPATH|d" "$PRELOADFILE"
+    die "Die Bibliothek lässt sich nicht laden – Eintrag wieder entfernt. Bitte Ausgabe von  LD_PRELOAD=$NEWSO /bin/true  schicken."
+  fi
+fi
 
 for MP in $REMOUNTED; do mount -o remount,ro "$MP" 2>/dev/null || true; done
 
-say "Fertig. Neue Zeile:"
-sed -n "${LINENO_}p" "$LAUNCHER" | sed 's/^/   /'
-say "Jetzt die Force neu starten. Log danach: $TARGETDIR/srate.log"
-say "Notaus: leere Datei $TARGETDIR/srate.off anlegen und neu starten."
+say "Fertig. Inhalt von $PRELOADFILE:"
+sed 's/^/     /' "$PRELOADFILE"
+# Bleibt /etc nach dem Neustart erhalten? (tmpfs wäre flüchtig)
+ETCFS=$(df -P "$(dirname "$PRELOADFILE")" 2>/dev/null | awk 'NR==2{print $1" auf "$NF}')
+say "/etc liegt auf: $ETCFS"
+say "Jetzt die Force neu starten und danach prüfen:  cat /etc/ld.so.preload"
+[ -n "$LOGPATH" ] && say "Log danach: $LOGPATH"
+say "Notaus: touch $TARGETDIR/srate.off  und neu starten."
+say "Entfernen: sh $TARGETDIR/srate-uninstall.sh"

@@ -15,6 +15,9 @@ int snd_pcm_hw_params_set_format(snd_pcm_t *, snd_pcm_hw_params_t *, int);
 int snd_pcm_hw_params_set_channels(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned);
 int snd_pcm_hw_params_set_rate(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned, int);
 int snd_pcm_hw_params(snd_pcm_t *, snd_pcm_hw_params_t *);
+long snd_pcm_writei(snd_pcm_t *, const void *, unsigned long);
+#include <stdlib.h>
+#include <string.h>
 
 int main(void)
 {
@@ -26,11 +29,18 @@ int main(void)
     snd_pcm_hw_params_any(pcm, hw);
     snd_pcm_hw_params_set_access(pcm, hw, 3);   /* RW_INTERLEAVED */
     snd_pcm_hw_params_set_format(pcm, hw, 2);   /* S16_LE */
-    snd_pcm_hw_params_set_channels(pcm, hw, 2);
+    unsigned ch = getenv("TEST_CH") ? (unsigned)atoi(getenv("TEST_CH")) : 2;
+    snd_pcm_hw_params_set_channels(pcm, hw, ch);
     r = snd_pcm_hw_params_set_rate(pcm, hw, 44100, 0);
     printf("set_rate 44100 -> %d\n", r);
     r = snd_pcm_hw_params(pcm, hw);
     printf("hw_params -> %d\n", r);
+    if (r == 0) {
+        static short buf[256 * 32];
+        memset(buf, 0, sizeof buf);
+        long w = snd_pcm_writei(pcm, buf, 256);
+        printf("writei 256 -> %ld\n", w);
+    }
     snd_pcm_hw_params_free(hw);
     snd_pcm_close(pcm);
     return 0;

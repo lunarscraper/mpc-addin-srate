@@ -1,31 +1,35 @@
 #!/bin/sh
-# Entfernt mpc-addin-srate wieder: stellt die gesicherte Startdatei her
-# und löscht die Bibliothek. srate.conf und srate.log bleiben liegen.
+# Entfernt mpc-addin-srate: Eintrag aus /etc/ld.so.preload löschen
+# (bzw. Sicherung zurückspielen) und Bibliothek entfernen.
 set -e
-HERE=$(cd "$(dirname "$0")" && pwd)
+ROOT=${SRATE_TEST_ROOT:-}
+TARGETDIR="$ROOT/usr/lib/mpc-addin-srate"
+PRELOADFILE="$ROOT/etc/ld.so.preload"
+SOPATH="/usr/lib/mpc-addin-srate/libmpc-addin-srate.so"
 say() { echo "[srate] $*"; }
 
-STATE=""
-for d in "$HERE" $(find /media /usr /opt /etc -maxdepth 4 -name srate.installed 2>/dev/null | xargs -r -n1 dirname); do
-  [ -f "$d/srate.installed" ] && { STATE="$d/srate.installed"; break; }
-done
-[ -n "$STATE" ] || { say "Keine Installation gefunden."; exit 0; }
+[ -d "$TARGETDIR" ] || { say "Keine Installation gefunden."; exit 0; }
 
-TARGETDIR=$(dirname "$STATE")
-LAUNCHER=$(cat "$STATE")
-
-for p in "$TARGETDIR" "$(dirname "$LAUNCHER")"; do
-  touch "$p/.srate-w" 2>/dev/null || mount -o remount,rw "$(df "$p" | awk 'NR==2{print $6}')"
+REMOUNTED=""
+for p in "$(dirname "$PRELOADFILE")" "$TARGETDIR"; do
+  if ! touch "$p/.srate-w" 2>/dev/null; then
+    MP=$(df "$p" | awk 'NR==2{print $6}')
+    mount -o remount,rw "$MP" && REMOUNTED="$REMOUNTED $MP"
+  fi
   rm -f "$p/.srate-w"
 done
 
-if [ -f "$LAUNCHER.srate-bak" ]; then
-  cp -p "$LAUNCHER.srate-bak" "$LAUNCHER" && rm -f "$LAUNCHER.srate-bak"
-  say "Startdatei wiederhergestellt: $LAUNCHER"
-else
-  sed -i "s|$TARGETDIR/libmpc-addin-srate.so:||" "$LAUNCHER"
-  say "Eintrag aus $LAUNCHER entfernt."
+if [ -f "$PRELOADFILE" ]; then
+  sed -i "\|$SOPATH|d" "$PRELOADFILE"
+  if [ -f "$TARGETDIR/ld.so.preload.created" ] && [ ! -s "$PRELOADFILE" ]; then
+    rm -f "$PRELOADFILE"
+    say "$PRELOADFILE entfernt (war von srate angelegt)."
+  else
+    say "Eintrag aus $PRELOADFILE entfernt."
+  fi
 fi
-rm -f "$TARGETDIR/libmpc-addin-srate.so" "$STATE"
 sync
+rm -rf "$TARGETDIR"
+sync
+for MP in $REMOUNTED; do mount -o remount,ro "$MP" 2>/dev/null || true; done
 say "Entfernt. Bitte die Force neu starten."

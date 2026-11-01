@@ -28,7 +28,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
-#define SRATE_VERSION "0.1.0"
+#define SRATE_VERSION "0.1.1"
 
 typedef struct _snd_pcm snd_pcm_t;
 typedef struct _snd_pcm_hw_params snd_pcm_hw_params_t;
@@ -391,12 +391,156 @@ int snd_pcm_hw_params_set_access(snd_pcm_t *pcm, snd_pcm_hw_params_t *p, int acc
     return r;
 }
 
+/* Bei Fehlschlag: Wünsche der Force und Fähigkeiten des Geräts ins Log */
+typedef struct _snd_output snd_output_t;
+static void dump_params(const char *title, snd_pcm_t *pcm, snd_pcm_hw_params_t *p)
+{
+    static int (*attach)(snd_output_t **, FILE *, int);
+    static int (*dump)(const snd_pcm_hw_params_t *, snd_output_t *);
+    static int (*oclose)(snd_output_t *);
+    if (!attach) {
+        attach = (int (*)(snd_output_t **, FILE *, int))dlsym(RTLD_DEFAULT, "snd_output_stdio_attach");
+        dump   = (int (*)(const snd_pcm_hw_params_t *, snd_output_t *))dlsym(RTLD_DEFAULT, "snd_pcm_hw_params_dump");
+        oclose = (int (*)(snd_output_t *))dlsym(RTLD_DEFAULT, "snd_output_close");
+    }
+    if (!attach || !dump || !logf_ || !p) return;
+    slog("--- %s (%s) ---", title, pname(pcm));
+    pthread_mutex_lock(&log_mx);
+    snd_output_t *out;
+    if (attach(&out, logf_, 0) == 0) { dump(p, out); if (oclose) oclose(out); }
+    fflush(logf_);
+    pthread_mutex_unlock(&log_mx);
+}
+
 int snd_pcm_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t *p)
 {
     REAL(snd_pcm_hw_params);
+    static int (*pmalloc)(snd_pcm_hw_params_t **);
+    static void (*pfree)(snd_pcm_hw_params_t *);
+    static void (*pcopy)(snd_pcm_hw_params_t *, const snd_pcm_hw_params_t *);
+    static int (*pany)(snd_pcm_t *, snd_pcm_hw_params_t *);
+    if (!pmalloc) {
+        pmalloc = (int (*)(snd_pcm_hw_params_t **))dlsym(RTLD_DEFAULT, "snd_pcm_hw_params_malloc");
+        pfree   = (void (*)(snd_pcm_hw_params_t *))dlsym(RTLD_DEFAULT, "snd_pcm_hw_params_free");
+        pcopy   = (void (*)(snd_pcm_hw_params_t *, const snd_pcm_hw_params_t *))dlsym(RTLD_DEFAULT, "snd_pcm_hw_params_copy");
+        pany    = (int (*)(snd_pcm_t *, snd_pcm_hw_params_t *))dlsym(RTLD_DEFAULT, "snd_pcm_hw_params_any");
+    }
+    int tracked_ = !disabled && is_tracked(pcm);
+    snd_pcm_hw_params_t *saved = NULL;
+    if (tracked_ && pmalloc && pcopy && pmalloc(&saved) == 0) pcopy(saved, p);
+
     int r = real_snd_pcm_hw_params(pcm, p);
-    if (!disabled && is_tracked(pcm))
+    if (tracked_) {
         slog("hw_params %s -> %d %s", pname(pcm), r, r < 0 ? errstr(r) : "ok");
+        if (r < 0) {
+            dump_params("Anforderung der Force", pcm, saved);
+            snd_pcm_hw_params_t *any = NULL;
+            if (pmalloc && pany && pmalloc(&any) == 0) {
+                if (pany(pcm, any) == 0) dump_params("Moeglich laut Geraet", pcm, any);
+                pfree(any);
+            }
+        } else {
+            dump_params("Eingestellt", pcm, p);
+        }
+    }
+    if (saved && pfree) pfree(saved);
+    return r;
+}
+
+/* Weitere Einstellungen mitloggen */
+typedef unsigned long uframes;
+#define LOGPCM(fmt, ...) do { if (!disabled && is_tracked(pcm)) slog(fmt, __VA_ARGS__); } while (0)
+
+int snd_pcm_hw_params_set_channels_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *p, unsigned int *v)
+{
+    REAL(snd_pcm_hw_params_set_channels_near);
+    unsigned w = v ? *v : 0;
+    int r = real_snd_pcm_hw_params_set_channels_near(pcm, p, v);
+    LOGPCM("set_channels_near %s %u -> %d (bekommt %u)", pname(pcm), w, r, v ? *v : 0);
+    return r;
+}
+int snd_pcm_hw_params_set_channels_min(snd_pcm_t *pcm, snd_pcm_hw_params_t *p, unsigned int *v)
+{
+    REAL(snd_pcm_hw_params_set_channels_min);
+    unsigned w = v ? *v : 0;
+    int r = real_snd_pcm_hw_params_set_channels_min(pcm, p, v);
+    LOGPCM("set_channels_min %s %u -> %d", pname(pcm), w, r);
+    return r;
+}
+int snd_pcm_hw_params_set_channels_max(snd_pcm_t *pcm, snd_pcm_hw_params_t *p, unsigned int *v)
+{
+    REAL(snd_pcm_hw_params_set_channels_max);
+    unsigned w = v ? *v : 0;
+    int r = real_snd_pcm_hw_params_set_channels_max(pcm, p, v);
+    LOGPCM("set_channels_max %s %u -> %d", pname(pcm), w, r);
+    return r;
+}
+int snd_pcm_hw_params_set_period_size(snd_pcm_t *pcm, snd_pcm_hw_params_t *p, uframes v, int dir)
+{
+    REAL(snd_pcm_hw_params_set_period_size);
+    int r = real_snd_pcm_hw_params_set_period_size(pcm, p, v, dir);
+    LOGPCM("set_period_size %s %lu -> %d %s", pname(pcm), v, r, r < 0 ? errstr(r) : "ok");
+    return r;
+}
+int snd_pcm_hw_params_set_period_size_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *p, uframes *v, int *dir)
+{
+    REAL(snd_pcm_hw_params_set_period_size_near);
+    uframes w = v ? *v : 0;
+    int r = real_snd_pcm_hw_params_set_period_size_near(pcm, p, v, dir);
+    LOGPCM("set_period_size_near %s %lu -> %d (bekommt %lu)", pname(pcm), w, r, v ? *v : 0);
+    return r;
+}
+int snd_pcm_hw_params_set_period_size_integer(snd_pcm_t *pcm, snd_pcm_hw_params_t *p)
+{
+    REAL(snd_pcm_hw_params_set_period_size_integer);
+    int r = real_snd_pcm_hw_params_set_period_size_integer(pcm, p);
+    LOGPCM("set_period_size_integer %s -> %d", pname(pcm), r);
+    return r;
+}
+int snd_pcm_hw_params_set_buffer_size(snd_pcm_t *pcm, snd_pcm_hw_params_t *p, uframes v)
+{
+    REAL(snd_pcm_hw_params_set_buffer_size);
+    int r = real_snd_pcm_hw_params_set_buffer_size(pcm, p, v);
+    LOGPCM("set_buffer_size %s %lu -> %d %s", pname(pcm), v, r, r < 0 ? errstr(r) : "ok");
+    return r;
+}
+int snd_pcm_hw_params_set_buffer_size_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *p, uframes *v)
+{
+    REAL(snd_pcm_hw_params_set_buffer_size_near);
+    uframes w = v ? *v : 0;
+    int r = real_snd_pcm_hw_params_set_buffer_size_near(pcm, p, v);
+    LOGPCM("set_buffer_size_near %s %lu -> %d (bekommt %lu)", pname(pcm), w, r, v ? *v : 0);
+    return r;
+}
+int snd_pcm_hw_params_set_periods(snd_pcm_t *pcm, snd_pcm_hw_params_t *p, unsigned int v, int dir)
+{
+    REAL(snd_pcm_hw_params_set_periods);
+    int r = real_snd_pcm_hw_params_set_periods(pcm, p, v, dir);
+    LOGPCM("set_periods %s %u -> %d %s", pname(pcm), v, r, r < 0 ? errstr(r) : "ok");
+    return r;
+}
+int snd_pcm_hw_params_set_periods_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *p, unsigned int *v, int *dir)
+{
+    REAL(snd_pcm_hw_params_set_periods_near);
+    unsigned w = v ? *v : 0;
+    int r = real_snd_pcm_hw_params_set_periods_near(pcm, p, v, dir);
+    LOGPCM("set_periods_near %s %u -> %d (bekommt %u)", pname(pcm), w, r, v ? *v : 0);
+    return r;
+}
+int snd_pcm_hw_params_set_period_time_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *p, unsigned int *v, int *dir)
+{
+    REAL(snd_pcm_hw_params_set_period_time_near);
+    unsigned w = v ? *v : 0;
+    int r = real_snd_pcm_hw_params_set_period_time_near(pcm, p, v, dir);
+    LOGPCM("set_period_time_near %s %u -> %d (bekommt %u)", pname(pcm), w, r, v ? *v : 0);
+    return r;
+}
+int snd_pcm_hw_params_set_buffer_time_near(snd_pcm_t *pcm, snd_pcm_hw_params_t *p, unsigned int *v, int *dir)
+{
+    REAL(snd_pcm_hw_params_set_buffer_time_near);
+    unsigned w = v ? *v : 0;
+    int r = real_snd_pcm_hw_params_set_buffer_time_near(pcm, p, v, dir);
+    LOGPCM("set_buffer_time_near %s %u -> %d (bekommt %u)", pname(pcm), w, r, v ? *v : 0);
     return r;
 }
 

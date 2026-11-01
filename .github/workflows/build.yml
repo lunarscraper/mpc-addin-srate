@@ -1,0 +1,44 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version bestimmen
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          else
+            echo "VERSION=dev-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Bauen und testen (Debian Buster, armhf)
+        run: |
+          docker run --rm -e VERSION="$VERSION" -v "$PWD:/src" debian:buster \
+            bash /src/tools/ci_build.sh
+
+      - name: Build-Artefakt
+        uses: actions/upload-artifact@v4
+        with:
+          name: mpc-addin-srate-${{ env.VERSION }}
+          path: build/dist/*.zip
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/dist/*.zip
+          body: |
+            mpc-addin-srate ${{ env.VERSION }} – Abtastratenwandlung für 48-kHz-USB-Geräte (z. B. Roland SH-4d) an der Akai Force.
+            Installation: siehe README.md im ZIP.

@@ -28,7 +28,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
-#define SRATE_VERSION "0.1.1"
+#define SRATE_VERSION "0.2.0"
 
 typedef struct _snd_pcm snd_pcm_t;
 typedef struct _snd_pcm_hw_params snd_pcm_hw_params_t;
@@ -412,6 +412,96 @@ static void dump_params(const char *title, snd_pcm_t *pcm, snd_pcm_hw_params_t *
     pthread_mutex_unlock(&log_mx);
 }
 
+/*
+ * Rettungsversuch: Die Force verlangt sehr knappe, exakte Puffer
+ * (z. B. 3 x 128 Frames). Mit Umrechnung 44,1 -> 48 kHz ergeben sich
+ * für das Gerät krumme Werte (128 * 48000/44100 = 139,3), die der
+ * USB-Treiber ablehnt (-22). Wir stellen dieselben Grundwerte (Format,
+ * Kanäle, Rate) neu ein und lassen ALSA passende Puffer wählen –
+ * möglichst nah an der Anforderung, nie kleiner.
+ */
+typedef unsigned long ufr;
+static int try_relaxed(snd_pcm_t *pcm, snd_pcm_hw_params_t *p,
+                       const snd_pcm_hw_params_t *want,
+                       int (*real_hw)(snd_pcm_t *, snd_pcm_hw_params_t *),
+                       int (*pmalloc)(snd_pcm_hw_params_t **),
+                       void (*pfree)(snd_pcm_hw_params_t *),
+                       void (*pcopy)(snd_pcm_hw_params_t *, const snd_pcm_hw_params_t *),
+                       int (*pany)(snd_pcm_t *, snd_pcm_hw_params_t *))
+{
+#define SYM(var, name) var = (__typeof__(var))dlsym(RTLD_NEXT, name); if (!var) var = (__typeof__(var))dlsym(RTLD_DEFAULT, name)
+    int (*g_access)(const snd_pcm_hw_params_t *, int *);
+    int (*g_format)(const snd_pcm_hw_params_t *, int *);
+    int (*g_ch)(const snd_pcm_hw_params_t *, unsigned *);
+    int (*g_rate)(const snd_pcm_hw_params_t *, unsigned *, int *);
+    int (*g_per)(const snd_pcm_hw_params_t *, ufr *, int *);
+    int (*g_buf)(const snd_pcm_hw_params_t *, ufr *);
+    int (*s_access)(snd_pcm_t *, snd_pcm_hw_params_t *, int);
+    int (*s_format)(snd_pcm_t *, snd_pcm_hw_params_t *, int);
+    int (*s_ch)(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned);
+    int (*s_rate)(snd_pcm_t *, snd_pcm_hw_params_t *, unsigned, int);
+    int (*s_per)(snd_pcm_t *, snd_pcm_hw_params_t *, ufr *, int *);
+    int (*s_buf)(snd_pcm_t *, snd_pcm_hw_params_t *, ufr *);
+    int (*s_buf_min)(snd_pcm_t *, snd_pcm_hw_params_t *, ufr *);
+    SYM(g_access, "snd_pcm_hw_params_get_access");
+    SYM(g_format, "snd_pcm_hw_params_get_format");
+    SYM(g_ch,     "snd_pcm_hw_params_get_channels_min");
+    SYM(g_rate,   "snd_pcm_hw_params_get_rate_min");
+    SYM(g_per,    "snd_pcm_hw_params_get_period_size_min");
+    SYM(g_buf,    "snd_pcm_hw_params_get_buffer_size_min");
+    SYM(s_access, "snd_pcm_hw_params_set_access");
+    SYM(s_format, "snd_pcm_hw_params_set_format");
+    SYM(s_ch,     "snd_pcm_hw_params_set_channels");
+    SYM(s_rate,   "snd_pcm_hw_params_set_rate");
+    SYM(s_per,    "snd_pcm_hw_params_set_period_size_near");
+    SYM(s_buf,    "snd_pcm_hw_params_set_buffer_size_near");
+    SYM(s_buf_min,"snd_pcm_hw_params_set_buffer_size_min");
+#undef SYM
+    if (!want || !g_access || !g_format || !g_ch || !g_rate || !g_per || !g_buf ||
+        !s_access || !s_format || !s_ch || !s_rate || !s_per || !s_buf || !s_buf_min)
+        return -22;
+
+    int acc = 3, fmt = 10, d = 0;
+    unsigned ch = 2, rate = 44100;
+    ufr per = 128, buf = 384;
+    g_access(want, &acc); g_format(want, &fmt); g_ch(want, &ch);
+    g_rate(want, &rate, &d); g_per(want, &per, &d); g_buf(want, &buf);
+    if (per < 16) per = 128;
+    if (buf < per * 2) buf = per * 2;
+
+    /* Versuche: (Periode, Mindestpuffer) – erst nah dran, dann großzügiger */
+    struct { ufr per, buf; } tries[] = {
+        { per,     buf     },
+        { per,     buf * 2 },
+        { per * 2, buf * 2 },
+        { per * 2, buf * 4 },
+        { 512,     2048    },
+    };
+    snd_pcm_hw_params_t *t = NULL;
+    if (pmalloc(&t) < 0) return -22;
+    int r = -22;
+    for (size_t i = 0; i < sizeof tries / sizeof tries[0]; i++) {
+        if (pany(pcm, t) < 0) break;
+        if (s_access(pcm, t, acc) < 0 || s_format(pcm, t, fmt) < 0 ||
+            s_ch(pcm, t, ch) < 0 || s_rate(pcm, t, rate, 0) < 0) {
+            slog("  Rettung: Grundwerte (Format %d, %u Kanaele, %u Hz) nicht setzbar", fmt, ch, rate);
+            break;
+        }
+        ufr pp = tries[i].per, bb = tries[i].buf;
+        int dd = 0;
+        int e1 = s_per(pcm, t, &pp, &dd);
+        int e2 = s_buf_min(pcm, t, &bb);
+        ufr bnear = tries[i].buf;
+        int e3 = s_buf(pcm, t, &bnear);
+        r = real_hw(pcm, t);
+        slog("  Rettung %zu: Periode %lu->%lu, Puffer >=%lu ->%lu (%d/%d/%d) -> %d %s",
+             i + 1, tries[i].per, pp, tries[i].buf, bnear, e1, e2, e3, r, r < 0 ? errstr(r) : "ok");
+        if (r == 0) { pcopy(p, t); break; }
+    }
+    pfree(t);
+    return r;
+}
+
 int snd_pcm_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t *p)
 {
     REAL(snd_pcm_hw_params);
@@ -430,8 +520,14 @@ int snd_pcm_hw_params(snd_pcm_t *pcm, snd_pcm_hw_params_t *p)
     if (tracked_ && pmalloc && pcopy && pmalloc(&saved) == 0) pcopy(saved, p);
 
     int r = real_snd_pcm_hw_params(pcm, p);
+    if (tracked_ && getenv("SRATE_TEST_FAILFIRST")) { static int once; if (!once++) r = -22; }
     if (tracked_) {
         slog("hw_params %s -> %d %s", pname(pcm), r, r < 0 ? errstr(r) : "ok");
+        if (r == -22 && cfg.mode == MODE_PLUG && saved) {
+            slog("Rettungsversuch mit passenden Puffergroessen ...");
+            r = try_relaxed(pcm, p, saved, real_snd_pcm_hw_params, pmalloc, pfree, pcopy, pany);
+            if (r == 0) { dump_params("Eingestellt nach Rettung", pcm, p); if (saved && pfree) pfree(saved); return 0; }
+        }
         if (r < 0) {
             dump_params("Anforderung der Force", pcm, saved);
             snd_pcm_hw_params_t *any = NULL;
